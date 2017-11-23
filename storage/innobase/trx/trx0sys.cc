@@ -290,7 +290,7 @@ trx_sys_update_wsrep_checkpoint(
 		read_wsrep_xid_uuid(xid, xid_uuid);
 
 		if (!memcmp(xid_uuid, trx_sys_cur_xid_uuid, 8)) {
-			ut_ad(xid_seqno > trx_sys_cur_xid_seqno);
+			ut_ad(xid_seqno >= trx_sys_cur_xid_seqno);
 			trx_sys_cur_xid_seqno = xid_seqno;
 		} else {
 			memcpy(trx_sys_cur_xid_uuid, xid_uuid, 16);

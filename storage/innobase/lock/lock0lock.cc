@@ -78,17 +78,17 @@ static
 const lock_t*
 lock_rec_has_to_wait_in_queue(
 /*==========================*/
-	const lock_t*	wait_lock);	/*!< in: waiting record lock */
+	const lock_t*	wait_lock, 	/*!< in: waiting record lock */
+	bool validate=false);		/*!< in: true if only vaidate */
 
 /*************************************************************//**
 Grants a lock to a waiting lock request and releases the waiting transaction.
-The caller must hold lock_sys->mutex. */
+The caller must hold lock_sys->mutex.
+@param[in,out]	lock	waiting lock request */
 static
 void
 lock_grant(
-/*=======*/
-	lock_t*	lock,	/*!< in/out: waiting lock request */
-	bool	owns_trx_mutex);    /*!< in: whether lock->trx->mutex is owned */
+	lock_t*	lock);
 
 extern "C" void thd_rpl_deadlock_check(MYSQL_THD thd, MYSQL_THD other_thd);
 extern "C" int thd_need_wait_reports(const MYSQL_THD thd);
@@ -1417,10 +1417,8 @@ wsrep_kill_victim(
 					   << wsrep_thd_query(lock->trx->mysql_thd);
 			}
 
-			lock->trx->abort_type = TRX_WSREP_ABORT;
 			wsrep_innobase_kill_one_trx(trx->mysql_thd,
 				(const trx_t*) trx, lock->trx, TRUE);
-			lock->trx->abort_type = TRX_SERVER_ABORT;
 		}
 	}
 }
@@ -1825,7 +1823,9 @@ lock_rec_insert_by_trx_age(
 		cell->node = in_lock;
 		in_lock->hash = node;
 		if (lock_get_wait(in_lock)) {
-			lock_grant(in_lock, true);
+			trx_mutex_exit(in_lock->trx);
+			lock_grant(in_lock);
+			trx_mutex_enter(in_lock->trx);
 			return DB_SUCCESS_LOCKED_REC;
 		}
 		return DB_SUCCESS;
@@ -1839,7 +1839,10 @@ lock_rec_insert_by_trx_age(
 	in_lock->hash = next;
 
 	if (lock_get_wait(in_lock) && !lock_rec_has_to_wait_in_queue(in_lock)) {
-		lock_grant(in_lock, true);
+		trx_mutex_exit(in_lock->trx);
+		lock_grant(in_lock);
+		trx_mutex_enter(in_lock->trx);
+
 		if (cell->node != in_lock) {
 			// Move it to the front of the queue
 			node->hash = in_lock->hash;
@@ -1955,25 +1958,23 @@ RecLock::lock_add(lock_t* lock, bool add_to_hash)
 /**
 Create a new lock.
 @param[in,out] trx		Transaction requesting the lock
-@param[in] owns_trx_mutex	true if caller owns the trx_t::mutex
 @param[in] add_to_hash		add the lock to hash table
 @param[in] prdt			Predicate lock (optional)
 @return a new lock instance */
 lock_t*
-RecLock::create(trx_t* trx, bool owns_trx_mutex, bool add_to_hash, const lock_prdt_t* prdt)
+RecLock::create(trx_t* trx, bool add_to_hash, const lock_prdt_t* prdt)
 {
-	return create(NULL, trx, owns_trx_mutex, add_to_hash, prdt);
+	return create(NULL, trx, add_to_hash, prdt);
 }
 lock_t*
 RecLock::create(
 	lock_t* const c_lock,
 	trx_t*	trx,
-	bool	owns_trx_mutex,
 	bool	add_to_hash,
 	const	lock_prdt_t* prdt)
 {
 	ut_ad(lock_mutex_own());
-	ut_ad(owns_trx_mutex == trx_mutex_own(trx));
+	ut_ad(trx->trx_mutex_taken == trx_mutex_own(trx));
 
 	/* Create the explicit lock instance and initialise it. */
 
@@ -2011,6 +2012,7 @@ RecLock::create(
 		 * if victim was waiting for some other lock
 		 */
 		trx_mutex_enter(c_lock->trx);
+
 		if (c_lock->trx->lock.que_state == TRX_QUE_LOCK_WAIT) {
 
 			c_lock->trx->lock.was_chosen_as_deadlock_victim = TRUE;
@@ -2031,14 +2033,16 @@ RecLock::create(
 			   victim lock release. This will eventually call
 			   lock_grant, which wants to grant trx mutex again
 			*/
-			if (owns_trx_mutex) {
+			bool retake_trx_mutex = false;
+			if (trx->trx_mutex_taken) {
 				trx_mutex_exit(trx);
+				retake_trx_mutex = true;
 			}
 
 			lock_cancel_waiting_and_release(
 				c_lock->trx->lock.wait_lock);
 
-			if (owns_trx_mutex) {
+			if (retake_trx_mutex) {
 				trx_mutex_enter(trx);
 			}
 
@@ -2078,13 +2082,15 @@ RecLock::create(
 	lock state and lock data structures while we are adding the
 	lock and changing the transaction state to LOCK_WAIT */
 
-	if (!owns_trx_mutex) {
+	bool retake_trx_mutex = false;
+	if (!trx->trx_mutex_taken) {
 		trx_mutex_enter(trx);
+		retake_trx_mutex = true;
 	}
 
 	lock_add(lock, add_to_hash);
 
-	if (!owns_trx_mutex) {
+	if (retake_trx_mutex) {
 		trx_mutex_exit(trx);
 	}
 #ifdef WITH_WSREP
@@ -2252,7 +2258,7 @@ RecLock::add_to_waitq(const lock_t* wait_for, const lock_prdt_t* prdt)
 	bool	high_priority = trx_is_high_priority(m_trx);
 
 	/* Don't queue the lock to hash table, if high priority transaction. */
-	lock_t*	lock = create(m_trx, true, !high_priority, prdt);
+	lock_t*	lock = create(m_trx, !high_priority, prdt);
 
 	/* Attempt to jump over the low priority waiting locks. */
 	if (high_priority && jump_queue(lock, wait_for)) {
@@ -2304,14 +2310,11 @@ lock_rec_add_to_queue(
 					the record */
 	ulint			heap_no,/*!< in: heap number of the record */
 	dict_index_t*		index,	/*!< in: index of record */
-	trx_t*			trx,	/*!< in/out: transaction */
-	bool			caller_owns_trx_mutex)
-					/*!< in: TRUE if caller owns the
-					transaction mutex */
+	trx_t*			trx)	/*!< in/out: transaction */
 {
 #ifdef UNIV_DEBUG
 	ut_ad(lock_mutex_own());
-	ut_ad(caller_owns_trx_mutex == trx_mutex_own(trx));
+	ut_ad(trx->trx_mutex_taken == trx_mutex_own(trx));
 	ut_ad(dict_index_is_clust(index)
 	      || dict_index_get_online_status(index) != ONLINE_INDEX_CREATION);
 	switch (type_mode & LOCK_MODE_MASK) {
@@ -2409,7 +2412,7 @@ lock_rec_add_to_queue(
 
 	RecLock		rec_lock(index, block, heap_no, type_mode);
 
-	rec_lock.create(trx, caller_owns_trx_mutex, true);
+	rec_lock.create(trx, true);
 }
 
 /*********************************************************************//**
@@ -2465,7 +2468,7 @@ lock_rec_lock_fast(
 			RecLock	rec_lock(index, block, heap_no, mode);
 
 			/* Note that we don't own the trx mutex. */
-			rec_lock.create(trx, false, true);
+			rec_lock.create(trx, true);
 		}
 
 		status = LOCK_REC_SUCCESS_CREATED;
@@ -2567,8 +2570,7 @@ lock_rec_lock_slow(
 			we already own the transaction mutex. */
 
 			lock_rec_add_to_queue(
-				LOCK_REC | mode, block, heap_no, index, trx,
-				true);
+				LOCK_REC | mode, block, heap_no, index, trx);
 
 			err = DB_SUCCESS_LOCKED_REC;
 		} else {
@@ -2642,7 +2644,8 @@ static
 const lock_t*
 lock_rec_has_to_wait_in_queue(
 /*==========================*/
-	const lock_t*	wait_lock)	/*!< in: waiting record lock */
+	const lock_t*	wait_lock,
+	bool		validate)
 {
 	const lock_t*	lock;
 	ulint		space;
@@ -2675,10 +2678,30 @@ lock_rec_has_to_wait_in_queue(
 		    && (p[bit_offset] & bit_mask)
 		    && lock_has_to_wait(wait_lock, lock)) {
 #ifdef WITH_WSREP
+			if (!validate) {
 			if (wsrep_thd_is_BF(wait_lock->trx->mysql_thd, FALSE) &&
 			    wsrep_thd_is_BF(lock->trx->mysql_thd, TRUE)) {
 				/* don't wait for another BF lock */
+				if (wsrep_debug) {
+					ib::info() << "WSREP: BF lock:";
+					wsrep_trx_print_locking(stderr, wait_lock->trx, 3000);
+					ib::info() << "WSREP: Do not wait for another BF lock:";
+					wsrep_trx_print_locking(stderr, lock->trx, 3000);
+				}
 				continue;
+			}
+
+			if (wsrep_thd_is_BF(wait_lock->trx->mysql_thd, FALSE) &&
+			    lock->trx->lock.wait_lock) {
+				if (wsrep_debug) {
+					ib::info() << "WSREP: BF lock granted :";
+					wsrep_trx_print_locking(stderr, wait_lock->trx, 3000);
+					ib::info() << "WSREP: before normal one:";
+					wsrep_trx_print_locking(stderr, lock->trx, 3000);
+				}
+				/* don't wait for normal lock still in wait state */
+				continue;
+			}
 			}
 #endif /* WITH_WSREP */
 
@@ -2691,22 +2714,20 @@ lock_rec_has_to_wait_in_queue(
 
 /*************************************************************//**
 Grants a lock to a waiting lock request and releases the waiting transaction.
-The caller must hold lock_sys->mutex but not lock->trx->mutex. */
+The caller must hold lock_sys->mutex.
+@param[in,out]	lock		waiting lock request */
 static
 void
 lock_grant(
-/*=======*/
-	lock_t*	lock,	/*!< in/out: waiting lock request */
-	bool	owns_trx_mutex)    /*!< in: whether lock->trx->mutex is owned */
+	lock_t*	lock)
 {
 	ut_ad(lock_mutex_own());
-	ut_ad(trx_mutex_own(lock->trx) == owns_trx_mutex);
+	ut_ad(!trx_mutex_own(lock->trx));
+
+	trx_mutex_enter(lock->trx);
+	ut_ad(trx_mutex_own(lock->trx));
 
 	lock_reset_lock_and_trx_wait(lock);
-
-	if (!owns_trx_mutex) {
-		trx_mutex_enter(lock->trx);
-	}
 
 	if (lock_get_mode(lock) == LOCK_AUTO_INC) {
 		dict_table_t*	table = lock->un_member.tab_lock.table;
@@ -2739,9 +2760,7 @@ lock_grant(
 		}
 	}
 
-	if (!owns_trx_mutex) {
-		trx_mutex_exit(lock->trx);
-	}
+	trx_mutex_exit(lock->trx);
 }
 
 /**
@@ -2910,8 +2929,6 @@ RecLock::make_trx_hit_list(
 
 		/* All locks ahead in the queue are checked. */
 		if (next == lock) {
-
-			ut_ad(next->is_waiting());
 			break;
 		}
 
@@ -3020,11 +3037,11 @@ lock_grant_and_move_on_page(
 	if (previous == NULL) {
 		return;
 	}
+
 	if (previous->un_member.rec_lock.space == space &&
 		previous->un_member.rec_lock.page_no == page_no) {
 		lock = previous;
-	}
-	else {
+	} else {
 		while (previous->hash &&
 				(previous->hash->un_member.rec_lock.space != space ||
 				previous->hash->un_member.rec_lock.page_no != page_no)) {
@@ -3043,22 +3060,8 @@ lock_grant_and_move_on_page(
 			&& lock_get_wait(lock)
 			&& !lock_rec_has_to_wait_in_queue(lock)) {
 
-			
-			bool exit_trx_mutex = false;
-			
-			if (lock->trx->abort_type != TRX_SERVER_ABORT) {
-				ut_ad(trx_mutex_own(lock->trx));
-				trx_mutex_exit(lock->trx);
-				exit_trx_mutex = true;
-			}
-			
-			lock_grant(lock, false);
-			
-			if (exit_trx_mutex) {
-				ut_ad(!trx_mutex_own(lock->trx));
-				trx_mutex_enter(lock->trx);
-			}
-			
+			lock_grant(lock);
+
 			if (previous != NULL) {
 				/* Move the lock to the head of the list. */
 				HASH_GET_NEXT(hash, previous) = HASH_GET_NEXT(hash, lock);
@@ -3067,6 +3070,7 @@ lock_grant_and_move_on_page(
 				/* Already at the head of the list. */
 				previous = lock;
 			}
+
 			/* Move on to the next lock. */
 			lock = static_cast<lock_t *>(HASH_GET_NEXT(hash, previous));
 		} else {
@@ -3079,17 +3083,16 @@ lock_grant_and_move_on_page(
 /*************************************************************//**
 Removes a record lock request, waiting or granted, from the queue and
 grants locks to other transactions in the queue if they now are entitled
-to a lock. NOTE: all record locks contained in in_lock are removed. */
+to a lock. NOTE: all record locks contained in in_lock are removed.
+@param[in]	in_lock		Record lock object: all record locks
+				which are contained in this lock object
+				are removed; transactions waiting behind
+				will get their lock requests granted,
+				if they are now qualified to it.*/
 static
 void
 lock_rec_dequeue_from_page(
-/*=======================*/
-	lock_t*		in_lock)	/*!< in: record lock object: all
-					record locks which are contained in
-					this lock object are removed;
-					transactions waiting behind will
-					get their lock requests granted,
-					if they are now qualified to it */
+	lock_t*		in_lock)
 {
 	ulint		space;
 	ulint		page_no;
@@ -3127,6 +3130,28 @@ lock_rec_dequeue_from_page(
 		grant locks if there are no conflicting locks ahead. Stop at
 		the first X lock that is waiting or has been granted. */
 
+		// first BF locks
+		if (in_lock->trx->mysql_thd && wsrep_on(in_lock->trx->mysql_thd)) {
+			for (lock = lock_rec_get_first_on_page_addr(lock_hash, space,
+                                                           page_no);
+			     lock != NULL;
+			     lock = lock_rec_get_next_on_page(lock)) {
+
+				if (wsrep_thd_is_BF(lock->trx->mysql_thd, FALSE)) {
+					ib::info() << "BF lock in lock_dequeue_from_page "
+						   << lock->trx->id;
+
+					if (lock_get_wait(lock)
+					    && lock_rec_has_to_wait_in_queue(lock)) {
+						/* Grant the lock */
+						ut_ad(lock->trx != in_lock->trx);
+						lock_grant(lock);
+					}
+				}
+			}
+		}
+
+		// second round with ordinary  locks
 		for (lock = lock_rec_get_first_on_page_addr(lock_hash, space,
 							    page_no);
 			 lock != NULL;
@@ -3137,26 +3162,12 @@ lock_rec_dequeue_from_page(
 
 				/* Grant the lock */
 				ut_ad(lock->trx != in_lock->trx);
-
-				bool exit_trx_mutex = false;
-
-				if (lock->trx->abort_type != TRX_SERVER_ABORT) {
-					ut_ad(trx_mutex_own(lock->trx));
-					trx_mutex_exit(lock->trx);
-					exit_trx_mutex = true;
-				}
-
-				lock_grant(lock, false);
-
-				if (exit_trx_mutex) {
-					ut_ad(!trx_mutex_own(lock->trx));
-					trx_mutex_enter(lock->trx);
-				}
+				lock_grant(lock);
 			}
 		}
-		} else {
-			lock_grant_and_move_on_page(lock_hash, space, page_no);
-		}
+	} else {
+		lock_grant_and_move_on_page(lock_hash, space, page_no);
+	}
 }
 
 /*************************************************************//**
@@ -3339,7 +3350,7 @@ lock_rec_inherit_to_gap(
 			lock_rec_add_to_queue(
 				LOCK_REC | LOCK_GAP | lock_get_mode(lock),
 				heir_block, heir_heap_no, lock->index,
-				lock->trx, FALSE);
+				lock->trx);
 		}
 	}
 }
@@ -3375,7 +3386,7 @@ lock_rec_inherit_to_gap_if_gap_lock(
 			lock_rec_add_to_queue(
 				LOCK_REC | LOCK_GAP | lock_get_mode(lock),
 				block, heir_heap_no, lock->index,
-				lock->trx, FALSE);
+				lock->trx);
 		}
 	}
 
@@ -3429,7 +3440,7 @@ lock_rec_move_low(
 
 		lock_rec_add_to_queue(
 			type_mode, receiver, receiver_heap_no,
-			lock->index, lock->trx, FALSE);
+			lock->index, lock->trx);
 	}
 
 	ut_ad(lock_rec_get_first(lock_sys->rec_hash,
@@ -3594,7 +3605,7 @@ lock_move_reorganize_page(
 
 				lock_rec_add_to_queue(
 					lock->type_mode, block, new_heap_no,
-					lock->index, lock->trx, FALSE);
+					lock->index, lock->trx);
 			}
 
 			if (new_heap_no == PAGE_HEAP_NO_SUPREMUM) {
@@ -3705,7 +3716,7 @@ lock_move_rec_list_end(
 
 				lock_rec_add_to_queue(
 					type_mode, new_block, rec2_heap_no,
-					lock->index, lock->trx, FALSE);
+					lock->index, lock->trx);
 			}
 		}
 	}
@@ -3795,7 +3806,7 @@ lock_move_rec_list_start(
 
 				lock_rec_add_to_queue(
 					type_mode, new_block, rec2_heap_no,
-					lock->index, lock->trx, FALSE);
+					lock->index, lock->trx);
 			}
 		}
 
@@ -3888,7 +3899,7 @@ lock_rtr_move_rec_list(
 
 				lock_rec_add_to_queue(
 					type_mode, new_block, rec2_heap_no,
-					lock->index, lock->trx, FALSE);
+					lock->index, lock->trx);
 
 				rec_move[moved].moved = true;
 			}
@@ -4901,7 +4912,7 @@ lock_table_dequeue(
 
 			/* Grant the lock */
 			ut_ad(in_lock->trx != lock->trx);
-			lock_grant(lock, false);
+			lock_grant(lock);
 		}
 	}
 }
@@ -5027,7 +5038,7 @@ lock_grant_and_move_on_rec(
 			&& lock_get_wait(lock)
 			&& !lock_rec_has_to_wait_in_queue(lock)) {
 
-			lock_grant(lock, false);
+			lock_grant(lock);
 
 			if (previous != NULL) {
 				/* Move the lock to the head of the list. */
@@ -5119,7 +5130,7 @@ released:
 
 				/* Grant the lock */
 				ut_ad(trx != lock->trx);
-				lock_grant(lock, false);
+				lock_grant(lock);
 			}
 		}
 	} else {
@@ -6244,7 +6255,7 @@ lock_rec_queue_validate(
 			ut_ad(!trx_is_ac_nl_ro(lock->trx));
 
 			if (lock_get_wait(lock)) {
-				ut_a(lock_rec_has_to_wait_in_queue(lock));
+				ut_a(lock_rec_has_to_wait_in_queue(lock, true));
 			}
 
 			if (index != NULL) {
@@ -6354,7 +6365,7 @@ lock_rec_queue_validate(
 #endif /* WITH_WSREP */
 		} else if (lock_get_wait(lock) && !lock_rec_get_gap(lock)) {
 
-			ut_a(lock_rec_has_to_wait_in_queue(lock));
+			ut_a(lock_rec_has_to_wait_in_queue(lock, true));
 		}
 	}
 
@@ -6822,7 +6833,7 @@ lock_rec_convert_impl_to_expl_for_trx(
 		type_mode = (LOCK_REC | LOCK_X | LOCK_REC_NOT_GAP);
 
 		lock_rec_add_to_queue(
-			type_mode, block, heap_no, index, trx, FALSE);
+			type_mode, block, heap_no, index, trx);
 	}
 
 	lock_mutex_exit();
@@ -7704,12 +7715,11 @@ dberr_t
 lock_trx_handle_wait(
 /*=================*/
 	trx_t*	trx,	/*!< in/out: trx lock state */
-	bool	lock_mutex_taken,
-	bool	trx_mutex_taken)
+	bool	lock_mutex_taken)
 {
 	dberr_t	err=DB_SUCCESS;
 	bool take_lock_mutex = false;
-	bool take_trx_mutex = false;
+	bool take_trx_mutex  = false;
 
 	if (!lock_mutex_taken) {
 		ut_ad(!lock_mutex_own());
@@ -7717,7 +7727,7 @@ lock_trx_handle_wait(
 		take_lock_mutex = true;
 	}
 
-	if (!trx_mutex_taken) {
+	if (!trx->trx_mutex_taken) {
 		ut_ad(!trx_mutex_own(trx));
 		trx_mutex_enter(trx);
 		take_trx_mutex = true;
@@ -7732,8 +7742,8 @@ lock_trx_handle_wait(
 		/* We take trx mutex for waiting trx if we have not yet
 		already taken it or we know that waiting trx and parameter
 		trx are not same and we are not already holding trx mutex. */
-		if ((wait_trx && wait_trx == trx && !take_trx_mutex && !trx_mutex_taken) ||
-		    (wait_trx && wait_trx != trx && wait_trx->abort_type == TRX_SERVER_ABORT)) {
+		if ((wait_trx && wait_trx == trx && !trx->trx_mutex_taken) ||
+		    (wait_trx && wait_trx != trx && !wait_trx->trx_mutex_taken)) {
 			ut_ad(!trx_mutex_own(wait_trx));
 			trx_mutex_enter(wait_trx);
 			take_wait_trx_mutex = true;

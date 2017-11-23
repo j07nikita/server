@@ -728,13 +728,11 @@ public:
 	/**
 	Create a lock for a transaction and initialise it.
 	@param[in, out] trx		Transaction requesting the new lock
-	@param[in] owns_trx_mutex	true if caller owns the trx_t::mutex
 	@param[in] add_to_hash		add the lock to hash table
 	@param[in] prdt			Predicate lock (optional)
 	@return new lock instance */
 	lock_t* create(
 		trx_t*		trx,
-		bool		owns_trx_mutex,
 		bool		add_to_hash,
 		const lock_prdt_t*
 				prdt = NULL);
@@ -742,7 +740,6 @@ public:
 	lock_t* create(
 		lock_t* const	c_lock,
 		trx_t*		trx,
-		bool		owns_trx_mutex,
 		bool		add_to_hash,
 		const lock_prdt_t*
 				prdt = NULL);

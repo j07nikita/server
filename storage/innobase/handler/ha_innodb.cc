@@ -4383,6 +4383,13 @@ innobase_change_buffering_inited_ok:
 			os_thread_sleep(20);
 	}
 
+	if (current_thd && wsrep_on(current_thd)
+		&& innodb_lock_schedule_algorithm == INNODB_LOCK_SCHEDULE_ALGORITHM_VATS) {
+		ib::info() << "In Galera environment Variance-Aware-Transaction-Sheduling Algorithm"
+			   << " is not supporting. Falling back to First-Come-First-Served order. ";
+		innodb_lock_schedule_algorithm = INNODB_LOCK_SCHEDULE_ALGORITHM_FCFS;
+	}
+
 	srv_was_started = true;
 	innodb_params_adjust();
 
@@ -5341,11 +5348,11 @@ innobase_kill_query(
 		bool trx_mutex_taken = false;
 
 		if (trx->lock.wait_lock) {
-			WSREP_DEBUG("Killing victim trx %p BF %d trx BF %d trx_id " IB_ID_FMT " ABORT %d thd %p"
+			WSREP_DEBUG("Killing victim trx %p BF %d trx BF %d trx_id " IB_ID_FMT " thd %p"
 				" current_thd %p BF %d",
 				trx, wsrep_thd_is_BF(trx->mysql_thd, FALSE),
 				wsrep_thd_is_BF(thd, FALSE),
-				trx->id, trx->abort_type,
+				trx->id,
 				trx->mysql_thd,
 				current_thd,
 				wsrep_thd_is_BF(current_thd, FALSE));
@@ -5356,12 +5363,12 @@ innobase_kill_query(
 			lock_mutex_taken = true;
 		}
 
-		if (trx->abort_type != TRX_WSREP_ABORT) {
+		if (!trx->trx_mutex_taken) {
 			trx_mutex_enter(trx);
 			trx_mutex_taken = true;
 		}
 
-		lock_trx_handle_wait(trx, true, true);
+		lock_trx_handle_wait(trx, true);
 
 		if (lock_mutex_taken) {
 			lock_mutex_exit();
@@ -20282,12 +20289,10 @@ wsrep_abort_transaction(
 	if (victim_trx) {
 		lock_mutex_enter();
 		trx_mutex_enter(victim_trx);
-		victim_trx->abort_type = TRX_WSREP_ABORT;
 		int rcode = wsrep_innobase_kill_one_trx(bf_thd, bf_trx,
                                                         victim_trx, signal);
 		trx_mutex_exit(victim_trx);
 		lock_mutex_exit();
-		victim_trx->abort_type = TRX_SERVER_ABORT;
 		wsrep_srv_conc_cancel_wait(victim_trx);
 		DBUG_RETURN(rcode);
 	} else {

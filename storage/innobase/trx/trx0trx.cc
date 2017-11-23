@@ -259,6 +259,7 @@ struct TrxFactory {
 
 		mutex_create(LATCH_ID_TRX, &trx->mutex);
 		mutex_create(LATCH_ID_TRX_UNDO, &trx->undo_mutex);
+		trx->trx_mutex_taken = false;
 
 		lock_trx_alloc_locks(trx);
 	}

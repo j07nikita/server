@@ -190,7 +190,10 @@ wsrep_is_BF_lock_timeout(
     trx_t* trx) /* in: trx to check for lock priority */
 {
 	if (wsrep_on_trx(trx) && wsrep_thd_is_BF(trx->mysql_thd, FALSE)) {
-		fprintf(stderr, "WSREP: BF lock wait long\n");
+		ib::error() << "WSREP: BF lock wait long for " << trx->id
+			    << " for query "
+			    << wsrep_thd_query(trx->mysql_thd);
+
 		srv_print_innodb_monitor 	= TRUE;
 		srv_print_innodb_lock_monitor 	= TRUE;
 		os_event_set(srv_monitor_event);

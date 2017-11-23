@@ -831,12 +831,6 @@ lock_rec_convert_impl_to_expl()) will access transactions associated
 to other connections. The locks of transactions are protected by
 lock_sys->mutex and sometimes by trx->mutex. */
 
-typedef enum {
-	TRX_SERVER_ABORT = 0,
-	TRX_WSREP_ABORT  = 1
-} trx_abort_t;
-
-
 /** Represents an instance of rollback segment along with its state variables.*/
 struct trx_undo_ptr_t {
 	trx_rseg_t*	rseg;		/*!< rollback segment assigned to the
@@ -889,6 +883,10 @@ struct trx_t {
 					state and lock (except some fields
 					of lock, which are protected by
 					lock_sys->mutex) */
+
+	bool		trx_mutex_taken;/*< This trx has acquired above
+					mutex, this knowledge is used
+					e.g. on async kill. */
 
 	/* Note: in_depth was split from in_innodb for fixing a RO
 	performance issue. Acquiring the trx_t::mutex for each row
@@ -1092,7 +1090,6 @@ struct trx_t {
 	/*------------------------------*/
 	THD*		mysql_thd;	/*!< MySQL thread handle corresponding
 					to this trx, or NULL */
-	trx_abort_t	abort_type;	/*!< Transaction abort type*/
 
 	const char*	mysql_log_file_name;
 					/*!< if MySQL binlog is used, this field
@@ -1376,10 +1373,12 @@ struct commit_node_t{
 /** Acquire the trx->mutex. */
 #define trx_mutex_enter(t) do {			\
 	mutex_enter(&t->mutex);			\
+	t->trx_mutex_taken = true;		\
 } while (0)
 
 /** Release the trx->mutex. */
 #define trx_mutex_exit(t) do {			\
+	t->trx_mutex_taken = false;		\
 	mutex_exit(&t->mutex);			\
 } while (0)
 
