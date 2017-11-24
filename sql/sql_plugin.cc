@@ -47,6 +47,10 @@
 #include <link.h>
 #endif
 
+#define STRINGIFY(x) #x
+#define TOSTRING(x) STRINGIFY(x)
+#define ITEM_COUNT(x) sizeof(x) / sizeof(x[0])
+
 extern struct st_maria_plugin *mysql_optional_plugins[];
 extern struct st_maria_plugin *mysql_mandatory_plugins[];
 
@@ -75,6 +79,21 @@ ulong plugin_maturity;
 */
 uint plugin_maturity_map[]=
 { 0, 1, 2, 3, 4, 5, 6 };
+
+uint maturity_name_to_number(const char* maturity_name)
+{
+  for (uint i = 0; i < ITEM_COUNT(plugin_maturity_map); ++i)
+  {
+    if (plugin_maturity_names[i] && !strcmp(maturity_name, plugin_maturity_names[i]))
+    {
+      return plugin_maturity_map[i];
+    }
+  }
+  return 0;
+}
+
+static const char* server_maturity_name = TOSTRING(SERVER_MATURITY_LEVEL);
+uint server_maturity = maturity_name_to_number(server_maturity_name);
 
 /*
   When you ad a new plugin type, add both a string and make sure that the
@@ -1155,6 +1174,7 @@ static bool plugin_add(MEM_ROOT *tmp_root,
       report_error(report, ER_CANT_OPEN_LIBRARY, dl->str, ENOEXEC, buf);
       goto err;
     }
+
     if (plugin_maturity_map[plugin->maturity] < plugin_maturity)
     {
       char buf[256];
@@ -1167,6 +1187,14 @@ static bool plugin_add(MEM_ROOT *tmp_root,
       report_error(report, ER_CANT_OPEN_LIBRARY, dl->str, EPERM, buf);
       goto err;
     }
+    else if (plugin_maturity_map[plugin->maturity] < server_maturity)
+    {
+      sql_print_warning("Plugin '%s' is of maturity level %s while the server is %s",
+        tmp.name.str,
+        plugin_maturity_names[plugin->maturity],
+        server_maturity_name);
+    }
+
     tmp.plugin= plugin;
     tmp.ref_count= 0;
     tmp.state= PLUGIN_IS_UNINITIALIZED;

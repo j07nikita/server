@@ -18,6 +18,8 @@
 [mysqld]
 disable-getopt-prefix-matching
 
+plugin-maturity=unknown
+
 open-files-limit=           1024
 local-infile
 character-set-server=      latin1

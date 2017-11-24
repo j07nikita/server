@@ -271,6 +271,10 @@ IF(NOT WIN32 AND NOT WITH_INNODB_MEMCACHED)
   ENDFOREACH()
 ENDIF()
 
+SET(SERVER_MATURITY "stable" CACHE STRING "The maturity of the server build. The levels correspond with plugin maturity levels. Possible values: 'unknown', 'experimental', 'alpha', 'beta', 'gamma', 'stable'" )
+string(TOLOWER ${SERVER_MATURITY} SERVER_MATURITY)
+ADD_DEFINITIONS( -DSERVER_MATURITY_LEVEL=${SERVER_MATURITY} )
+
 # safemalloc can be enabled and disabled independently
 SET(WITH_SAFEMALLOC "AUTO" CACHE STRING "Use safemalloc memory debugger. Will result in slower execution. Options are: ON OFF AUTO.")
 

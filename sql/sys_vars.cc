@@ -5361,12 +5361,14 @@ static Sys_var_ulong Sys_sp_cache_size(
 
 export const char *plugin_maturity_names[]=
 { "unknown", "experimental", "alpha", "beta", "gamma", "stable", 0 };
+extern uint server_maturity;
 static Sys_var_enum Sys_plugin_maturity(
        "plugin_maturity",
        "The lowest desirable plugin maturity. "
        "Plugins less mature than that will not be installed or loaded",
        READ_ONLY GLOBAL_VAR(plugin_maturity), CMD_LINE(REQUIRED_ARG),
-       plugin_maturity_names, DEFAULT(MariaDB_PLUGIN_MATURITY_UNKNOWN));
+       plugin_maturity_names,
+       DEFAULT(server_maturity > 0 ? server_maturity - 1 : 0));
 
 static Sys_var_ulong Sys_deadlock_search_depth_short(
        "deadlock_search_depth_short",
